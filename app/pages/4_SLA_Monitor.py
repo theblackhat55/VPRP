@@ -22,6 +22,10 @@ from app.models.remediation_service import get_remediation_summary
 st.set_page_config(page_title="VPRP — SLA Monitor", page_icon="⏰", layout="wide")
 st.title("⏰ SLA Monitoring & Notifications")
 
+from app.utils.auth_guard import require_login, show_user_sidebar
+current_user = require_login()
+show_user_sidebar()
+
 # ── Notification Channel Status ─────────────────────────
 st.header("Notification Channels")
 nc1, nc2 = st.columns(2)

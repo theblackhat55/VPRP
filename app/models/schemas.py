@@ -229,3 +229,25 @@ class RemediationAuditLog(Base):
 
     def __repr__(self):
         return f"<AuditLog {self.action} on {self.finding_id} by {self.performed_by}>"
+
+
+class User(Base):
+    """Local user accounts with hashed passwords."""
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(100), nullable=False, unique=True, index=True)
+    email = Column(String(300), nullable=False, unique=True, index=True)
+    password_hash = Column(String(500), nullable=False)
+    full_name = Column(String(200))
+    role = Column(String(30), nullable=False, default="viewer")  # admin, analyst, team_lead, viewer
+    team = Column(String(200))
+    is_active = Column(Boolean, default=True)
+    last_login = Column(DateTime)
+    login_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by = Column(String(100), default="system")
+
+    def __repr__(self):
+        return f"<User {self.username} ({self.role})>"

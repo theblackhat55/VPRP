@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
 st.title(f"{APP_ICON} {APP_NAME}")
+
+from app.utils.auth_guard import require_login, show_user_sidebar
+current_user = require_login()
+show_user_sidebar()
 st.caption(f"v{APP_VERSION} — Upload Defender CSV/JSON exports to get prioritized, team-specific remediation reports")
 
 

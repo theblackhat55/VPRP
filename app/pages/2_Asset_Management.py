@@ -11,6 +11,10 @@ from sqlalchemy import func
 
 st.set_page_config(page_title="VPRP — Assets", page_icon=APP_ICON, layout="wide")
 st.title(f"{APP_ICON} Asset Management")
+
+from app.utils.auth_guard import require_login, show_user_sidebar
+current_user = require_login()
+show_user_sidebar()
 st.caption("Manage asset criticality, business units, environments, and ownership")
 
 CRITICALITY_LABELS = {
