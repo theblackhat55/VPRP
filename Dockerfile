@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /data/uploads /data/reports /data/archives /data/logs && \
     chown -R appuser:appuser /data /app
 
+ENV PYTHONPATH=/app
+
 # ── Development Stage ────────────────────────────────────
 FROM base AS development
 
