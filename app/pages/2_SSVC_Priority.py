@@ -55,18 +55,38 @@ def save_ssvc_to_db(df: pd.DataFrame):
     """Persist SSVC columns back to the database."""
     session = SessionLocal()
     try:
-        ssvc_cols = [
-            "ssvc_exploitation", "ssvc_system_exposure", "ssvc_automatable",
-            "ssvc_human_impact", "ssvc_priority", "ssvc_evaluated_at",
-        ]
+        col_map = {
+            "ssvc_exploitation": "ssvc_exploitation",
+            "ssvc_system_exposure": "ssvc_system_exposure",
+            "ssvc_automatable": "ssvc_automatable",
+            "ssvc_human_impact": "ssvc_human_impact",
+            "ssvc_priority": "ssvc_priority",
+            "ssvc_evaluated_at": "ssvc_evaluated_at",
+        }
         updated = 0
-        for _, row in df.iterrows():
-            finding = session.query(Finding).filter(Finding.id == row["id"]).first()
-            if finding:
-                for col in ssvc_cols:
-                    if col in row and pd.notna(row[col]):
-                        setattr(finding, col, row[col])
-                updated += 1
+        for i in range(len(df)):
+            row_dict = df.iloc[i].to_dict()
+            finding_id = row_dict.get("id")
+            if finding_id is None:
+                continue
+            finding = session.query(Finding).filter(Finding.id == finding_id).first()
+            if not finding:
+                continue
+            for src_col, db_col in col_map.items():
+                if src_col not in row_dict:
+                    continue
+                val = row_dict[src_col]
+                if val is None:
+                    continue
+                if isinstance(val, float) and pd.isna(val):
+                    continue
+                if db_col == "ssvc_evaluated_at":
+                    if not isinstance(val, datetime):
+                        continue
+                else:
+                    val = str(val)[:30]  # Truncate to column max length
+                setattr(finding, db_col, val)
+            updated += 1
         session.commit()
         return updated
     except Exception as e:
@@ -92,7 +112,35 @@ with col_ctrl1:
 with col_ctrl2:
     if st.button("🔄 Run SSVC Evaluation", type="primary", use_container_width=True):
         with st.spinner("Evaluating SSVC decision tree..."):
+            # Drop existing DB ssvc columns to avoid duplicates after concat
+            db_ssvc_cols = [c for c in df.columns if c.startswith("ssvc_")]
+            df = df.drop(columns=db_ssvc_cols, errors="ignore")
+            
             df = evaluate_ssvc(df)
+            
+            # Drop engine's numeric ssvc_priority before renaming ssvc_decision
+            if "ssvc_priority" in df.columns:
+                df = df.drop(columns=["ssvc_priority"])
+            # Rename engine columns to match DB schema
+            rename_map = {
+                "ssvc_exposure": "ssvc_system_exposure",
+                "ssvc_decision": "ssvc_priority",
+            }
+            df = df.rename(columns=rename_map)
+            # Drop ssvc_sla_days (not in DB)
+            df = df.drop(columns=["ssvc_sla_days"], errors="ignore")
+            
+            # Convert ssvc_priority from numeric/decision to label
+            priority_map = {
+                "immediate": "Immediate", "out-of-cycle": "Out-of-Cycle",
+                "scheduled": "Scheduled", "defer": "Defer",
+                0: "Immediate", 1: "Out-of-Cycle", 2: "Scheduled", 3: "Defer",
+            }
+            if "ssvc_priority" in df.columns:
+                df["ssvc_priority"] = df["ssvc_priority"].map(
+                    lambda x: priority_map.get(x, priority_map.get(str(x).lower(), str(x)))
+                )
+            
             df["ssvc_evaluated_at"] = datetime.now(timezone.utc)
             saved = save_ssvc_to_db(df)
             st.cache_data.clear()
@@ -120,7 +168,10 @@ df_ssvc = df[df["ssvc_priority"].notna()].copy()
 # ── KPI Row ──
 st.subheader("Priority Overview")
 k1, k2, k3, k4, k5 = st.columns(5)
-summary = get_ssvc_summary(df_ssvc)
+summary = {
+    "total": len(df_ssvc),
+    "priority_counts": df_ssvc["ssvc_priority"].value_counts().to_dict() if "ssvc_priority" in df_ssvc.columns else {},
+}
 with k1:
     st.metric("Total Evaluated", summary.get("total", 0))
 with k2:

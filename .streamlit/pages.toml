@@ -1,0 +1,34 @@
+[[pages]]
+path = "app/Main.py"
+name = "Main"
+icon = "🏠"
+
+[[pages]]
+path = "app/pages/1_Asset_Management.py"
+name = "Asset Management"
+icon = "💻"
+
+[[pages]]
+path = "app/pages/2_SSVC_Priority.py"
+name = "SSVC Priority"
+icon = "🎯"
+
+[[pages]]
+path = "app/pages/3_Correlation.py"
+name = "Correlation"
+icon = "🔗"
+
+[[pages]]
+path = "app/pages/4_Remediation.py"
+name = "Remediation"
+icon = "🔧"
+
+[[pages]]
+path = "app/pages/5_Reports_Analytics.py"
+name = "Reports & Analytics"
+icon = "📊"
+
+[[pages]]
+path = "app/pages/6_Administration.py"
+name = "Administration"
+icon = "⚙️"

@@ -13,7 +13,7 @@ from app.models.auth_service import authenticate
 from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
 
 # ── Page config (must be first st command) ───────────────
-st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
+st.set_page_config(page_title="Main", page_icon=APP_ICON, layout="wide")
 
 # ── Hide sidebar + pages when not authenticated ─────────
 if not is_authenticated():

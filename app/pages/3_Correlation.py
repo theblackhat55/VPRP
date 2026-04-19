@@ -48,13 +48,38 @@ def save_correlation_to_db(df: pd.DataFrame):
     try:
         corr_cols = ["patch_group", "software_group", "correlation_cluster"]
         updated = 0
-        for _, row in df.iterrows():
-            finding = session.query(Finding).filter(Finding.id == row["id"]).first()
-            if finding:
-                for col in corr_cols:
-                    if col in row and pd.notna(row[col]):
-                        setattr(finding, col, str(row[col]))
-                updated += 1
+        for idx in range(len(df)):
+            finding_id = df.at[df.index[idx], "id"] if df.index[idx] in df.index else df.iloc[idx]["id"]
+            updates = {}
+            for col in corr_cols:
+                if col not in df.columns:
+                    continue
+                try:
+                    val = df.at[df.index[idx], col]
+                except Exception:
+                    val = df.iloc[idx][col]
+                if hasattr(val, 'item'):
+                    try:
+                        val = val.item()
+                    except (ValueError, TypeError):
+                        val = str(val)
+                if val is None:
+                    continue
+                if isinstance(val, float) and pd.isna(val):
+                    continue
+                try:
+                    if pd.isna(val):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                updates[col] = str(val)
+            
+            if updates:
+                finding = session.query(Finding).filter(Finding.id == finding_id).first()
+                if finding:
+                    for col, val in updates.items():
+                        setattr(finding, col, val)
+                    updated += 1
         session.commit()
         return updated
     except Exception as e:

@@ -16,6 +16,7 @@ HIDE_SIDEBAR_CSS = """
 """
 
 
+
 def is_authenticated() -> bool:
     return "user" in st.session_state and st.session_state["user"] is not None
 
