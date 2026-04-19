@@ -23,6 +23,7 @@ class ScanUpload(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filename = Column(String(500), nullable=False)
     source_type = Column(String(100))
+
     rows_parsed = Column(Integer, default=0)
     rows_after_dedup = Column(Integer, default=0)
     duplicates_removed = Column(Integer, default=0)
@@ -91,6 +92,25 @@ class Finding(Base):
     # Source tracking
     source_file = Column(String(500))
     source_type = Column(String(100))
+
+    # ── Remediation tracking ──
+    remediation_status = Column(String(30), nullable=False, default="open")
+    remediation_substatus = Column(String(50))
+    remediation_notes = Column(Text)
+    remediation_updated_at = Column(DateTime)
+    remediation_updated_by = Column(String(200))
+    assigned_to = Column(String(200))
+    ticket_id = Column(String(100))
+    ticket_url = Column(String(500))
+
+    # ── Exception / risk-acceptance ──
+    exception_status = Column(String(30))
+    exception_reason = Column(Text)
+    exception_requested_by = Column(String(200))
+    exception_requested_at = Column(DateTime)
+    exception_approved_by = Column(String(200))
+    exception_approved_at = Column(DateTime)
+    exception_expiry = Column(DateTime)
 
     scan_upload = relationship("ScanUpload", back_populates="findings")
 
@@ -188,3 +208,24 @@ class ScanSummary(Base):
 
     def __repr__(self):
         return f"<ScanSummary {self.scan_date} ({self.total_findings} findings)>"
+
+
+class RemediationAuditLog(Base):
+    """Tracks all status changes for audit compliance."""
+    __tablename__ = "remediation_audit_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    finding_id = Column(UUID(as_uuid=True), ForeignKey("findings.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String(50), nullable=False)
+    old_status = Column(String(30))
+    new_status = Column(String(30))
+    old_substatus = Column(String(50))
+    new_substatus = Column(String(50))
+    notes = Column(Text)
+    performed_by = Column(String(200), nullable=False, default="system")
+    performed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    finding = relationship("Finding", backref="audit_logs")
+
+    def __repr__(self):
+        return f"<AuditLog {self.action} on {self.finding_id} by {self.performed_by}>"
