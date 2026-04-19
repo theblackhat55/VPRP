@@ -74,7 +74,6 @@ TEAM_RULES = [
     ("softwareName", "contains", "rocky_linux", "OS Team"),
     ("softwareName", "contains", "macos", "OS Team"),
     ("softwareName", "contains", "mac_os", "OS Team"),
-    ("softwareVendor", "contains", "microsoft", "OS Team"),
     ("recommendationReference", "startswith", "va-_-microsoft-_-windows", "OS Team"),
     ("recommendationReference", "contains", "kernel", "OS Team"),
 
@@ -91,6 +90,7 @@ TEAM_RULES = [
     ("softwareName", "contains", "powershell", "NET / IIS Team"),
     ("recommendationReference", "contains", "asp.net", "NET / IIS Team"),
     ("recommendationReference", "contains", ".net_framework", "NET / IIS Team"),
+    ("softwareVendor", "contains", "microsoft", "OS Team"),
 
     # ── Cisco / Network Team ──────────────────────────────
     ("softwareVendor", "contains", "cisco", "Network / Cisco Team"),

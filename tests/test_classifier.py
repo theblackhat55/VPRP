@@ -21,7 +21,7 @@ class TestClassifyTeams:
     def test_classifies_dotnet(self, sample_defender_df):
         result = classify_teams(sample_defender_df)
         dotnet_row = result[result["cveId"] == "CVE-2024-0004"].iloc[0]
-        assert dotnet_row["assignedTeam"] == ".NET / IIS Team"
+        assert dotnet_row["assignedTeam"] == "NET / IIS Team"
 
     def test_classifies_manageengine(self, sample_defender_df):
         result = classify_teams(sample_defender_df)
