@@ -2,6 +2,7 @@
 VPRP — Vulnerability Prioritization & Remediation Platform
 Main Streamlit application entry point.
 """
+import logging
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -26,10 +27,19 @@ from app.engine.reporter import generate_excel_report, generate_team_csv
 from app.config import (
     DEFAULT_TEAM, load_custom_rules, get_all_team_names,
 )
+from app.models.db_service import (
+    save_scan_upload,
+    save_findings,
+    save_scan_summary,
+    upsert_assets_from_findings,
+    get_scan_history,
+    get_trend_data,
+)
 from app.utils.logger import setup_logging
 from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
 
 setup_logging()
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
 st.title(f"{APP_ICON} {APP_NAME}")
@@ -93,6 +103,64 @@ def _show_custom_rules_manager():
             st.warning("Match value cannot be empty")
 
 
+def _show_scan_history():
+    """Display recent scan uploads from the database."""
+    history = get_scan_history(limit=10)
+    if history:
+        hist_df = pd.DataFrame(history)
+        hist_df = hist_df[[
+            "uploaded_at", "filename", "source_type",
+            "rows_parsed", "rows_after_dedup", "unique_cves",
+            "unique_devices", "status",
+        ]]
+        hist_df.columns = [
+            "Uploaded", "Filename", "Source", "Rows Parsed",
+            "After Dedup", "Unique CVEs", "Devices", "Status",
+        ]
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No scan history yet. Upload your first Defender CSV to get started.")
+
+
+def _show_trends():
+    """Display vulnerability trend charts from historical scans."""
+    trend_df = get_trend_data(limit=30)
+    if trend_df.empty:
+        st.info("Trend data will appear after multiple scan uploads over time.")
+        return
+
+    # Findings over time
+    fig_trend = px.line(
+        trend_df, x="scan_date", y="total_findings",
+        title="Total Findings Over Time",
+        markers=True,
+    )
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    # Severity breakdown over time
+    sev_cols = ["critical", "high", "medium", "low"]
+    available_sev = [c for c in sev_cols if c in trend_df.columns]
+    if available_sev:
+        fig_sev_trend = px.area(
+            trend_df, x="scan_date", y=available_sev,
+            title="Severity Breakdown Over Time",
+            color_discrete_map={
+                "critical": "#FF4444", "high": "#FF8C00",
+                "medium": "#FFD700", "low": "#4CAF50",
+            },
+        )
+        st.plotly_chart(fig_sev_trend, use_container_width=True)
+
+    # Risk score trend
+    if "avg_risk" in trend_df.columns:
+        fig_risk = px.line(
+            trend_df, x="scan_date", y="avg_risk",
+            title="Average Risk Score Over Time",
+            markers=True,
+        )
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+
 # ── Sidebar ───────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
@@ -104,6 +172,8 @@ with st.sidebar:
                             help="Generate AI-powered summaries via Azure AI Foundry")
     enable_llm_classify = st.checkbox("Enable AI classification", value=False,
                                        help="Use LLM to classify unmatched findings (requires Azure AI)")
+    enable_db_save = st.checkbox("Save to database", value=True,
+                                  help="Persist scan results for historical tracking")
 
     st.divider()
     st.header("Upload Vulnerability Data")
@@ -143,6 +213,16 @@ if not uploaded_files:
     | Different column naming conventions (auto-mapped) | Yes |
     """)
 
+    # Scan History
+    st.divider()
+    with st.expander("Scan History", expanded=False):
+        _show_scan_history()
+
+    # Trends
+    with st.expander("Vulnerability Trends", expanded=False):
+        _show_trends()
+
+    # Custom Rules
     with st.expander("Manage Custom Classification Rules"):
         _show_custom_rules_manager()
     st.stop()
@@ -229,6 +309,42 @@ if enable_epss:
 
 with st.spinner("Grouping by root-cause patches..."):
     dedup = deduplicate_by_patch(combined)
+
+# ── Step 4: Save to Database ─────────────────────────────
+if enable_db_save:
+    try:
+        with st.spinner("Saving to database..."):
+            # Build filename list
+            filenames = ", ".join(r.filename for r in parse_results)
+            source_types = ", ".join(merge_stats["source_types_detected"])
+
+            # Save scan upload record
+            scan_upload = save_scan_upload(
+                filename=filenames,
+                source_type=source_types,
+                rows_parsed=merge_stats["total_rows_before_dedup"],
+                rows_after_dedup=merge_stats["total_rows_after_dedup"],
+                duplicates_removed=merge_stats["duplicates_removed"],
+                unique_cves=int(combined["cveId"].nunique()),
+                unique_devices=int(combined["deviceName"].nunique()),
+            )
+
+            # Save individual findings
+            saved_count = save_findings(combined, scan_upload.id)
+
+            # Save summary for trends
+            save_scan_summary(combined, scan_upload.id)
+
+            # Upsert asset registry
+            new_assets = upsert_assets_from_findings(combined)
+
+        st.success(
+            f"Saved to database: {saved_count:,} findings, "
+            f"{new_assets} new assets discovered"
+        )
+    except Exception as e:
+        logger.error(f"Database save failed: {e}")
+        st.warning(f"Database save failed (results still available below): {e}")
 
 # ── Classification Summary ───────────────────────────────
 st.divider()
@@ -436,6 +552,14 @@ for i, team in enumerate(teams):
             mime="text/csv",
             key=f"dl_{team}",
         )
+
+# ── Scan History & Trends ────────────────────────────────
+st.divider()
+with st.expander("Scan History"):
+    _show_scan_history()
+
+with st.expander("Vulnerability Trends"):
+    _show_trends()
 
 # ── Custom Rules Manager (bottom) ────────────────────────
 st.divider()
