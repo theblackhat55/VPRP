@@ -22,8 +22,10 @@ from app.models.remediation_service import get_remediation_summary
 st.set_page_config(page_title="VPRP — SLA Monitor", page_icon="⏰", layout="wide")
 st.title("⏰ SLA Monitoring & Notifications")
 
-from app.utils.auth_guard import require_login, show_user_sidebar
-current_user = require_login()
+from app.utils.auth_guard import require_auth, show_user_sidebar
+st.session_state["_page_id"] = "sla"
+current_user = require_auth()
+st.session_state["_page_id"] = "sla"
 show_user_sidebar()
 
 # ── Notification Channel Status ─────────────────────────

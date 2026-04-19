@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /data/uploads /data/reports /data/archives /data/logs && \
+RUN mkdir -p /data/uploads /data/reports /data/archives /data/logs /data/branding && \
     chown -R appuser:appuser /data /app
 
 ENV PYTHONPATH=/app

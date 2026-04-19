@@ -26,8 +26,10 @@ from app.models.remediation_service import (
 st.set_page_config(page_title="VPRP — Remediation", page_icon="🔧", layout="wide")
 st.title("🔧 Remediation Tracking")
 
-from app.utils.auth_guard import require_login, show_user_sidebar
-current_user = require_login()
+from app.utils.auth_guard import require_auth, show_user_sidebar
+st.session_state["_page_id"] = "remediation"
+current_user = require_auth()
+st.session_state["_page_id"] = "remediation"
 show_user_sidebar()
 
 # ── Auto-check expired exceptions on page load ──────────

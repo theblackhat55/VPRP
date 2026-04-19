@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 
 from app.utils.auth_guard import require_role, show_user_sidebar
+st.session_state["_page_id"] = "users"
 from app.models.auth_service import (
     list_users, create_user, update_user, change_password,
     delete_user, ROLES,
@@ -17,6 +18,7 @@ show_user_sidebar()
 
 # Admin-only access
 current_user = require_role("admin")
+st.session_state["_page_id"] = "users"
 
 # ── User List ───────────────────────────────────────────
 st.header("User Accounts")

@@ -3,10 +3,91 @@ VPRP — Vulnerability Prioritization & Remediation Platform
 Main Streamlit application entry point.
 """
 import logging
+import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+from app.utils.auth_guard import is_authenticated, show_user_sidebar, logout_user
+from app.models.auth_service import authenticate
+from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
+
+# ── Page config (must be first st command) ───────────────
+st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
+
+# ── Hide sidebar + pages when not authenticated ─────────
+if not is_authenticated():
+    # Hide sidebar completely
+    st.markdown("""
+    <style>
+        [data-testid="stSidebar"] { display: none; }
+        [data-testid="stSidebarNav"] { display: none; }
+        header[data-testid="stHeader"] { display: none; }
+        .stDeployButton { display: none; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Centered login page
+    st.markdown("<div style='height: 60px'></div>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    with col2:
+        # Logo
+        logo_path = "/data/branding/logo.png"
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=280)
+        else:
+            st.markdown("""
+            <div style="text-align:center;">
+                <span style="font-size:4em;">🛡️</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div style="text-align:center; padding: 10px 0 30px 0;">
+            <h1 style="margin-bottom:5px;">VPRP</h1>
+            <p style="color:#64748b; font-size:1.05em;">
+                Vulnerability Prioritization & Remediation Platform
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Login form
+        with st.form("login_form", clear_on_submit=False, border=True):
+            username = st.text_input("Username", placeholder="Enter your username")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+            with col_btn2:
+                submitted = st.form_submit_button("Sign In", type="primary", use_container_width=True)
+
+        if submitted:
+            if username and password:
+                user = authenticate(username, password)
+                if user:
+                    st.session_state["user"] = user
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+            else:
+                st.warning("Please enter both username and password.")
+
+        st.markdown("""
+        <div style="text-align:center; padding-top:25px; color:#94a3b8; font-size:0.8em;">
+            <p>Authorized personnel only. All access is logged.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.stop()
+
+# ══════════════════════════════════════════════════════════
+# AUTHENTICATED — main app starts below
+# ══════════════════════════════════════════════════════════
+
+show_user_sidebar()
+st.title(f"{APP_ICON} {APP_NAME}")
+st.caption(f"v{APP_VERSION} — Upload Defender CSV/JSON exports to get prioritized, team-specific remediation reports")
+
+# ── Imports (only loaded after auth) ─────────────────────
 from app.engine.parser import parse_uploaded_file, merge_multi_upload, FileParseResult
 from app.engine.classifier import (
     classify_teams,
@@ -37,19 +118,9 @@ from app.models.db_service import (
     get_asset_criticality_map,
 )
 from app.utils.logger import setup_logging
-from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
-st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
-st.title(f"{APP_ICON} {APP_NAME}")
-
-from app.utils.auth_guard import require_login, show_user_sidebar
-current_user = require_login()
-show_user_sidebar()
-st.caption(f"v{APP_VERSION} — Upload Defender CSV/JSON exports to get prioritized, team-specific remediation reports")
-
 
 # ── Helper: Custom Rules Manager UI ──────────────────────
 def _show_custom_rules_manager():

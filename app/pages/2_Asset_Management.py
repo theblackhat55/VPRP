@@ -12,8 +12,10 @@ from sqlalchemy import func
 st.set_page_config(page_title="VPRP — Assets", page_icon=APP_ICON, layout="wide")
 st.title(f"{APP_ICON} Asset Management")
 
-from app.utils.auth_guard import require_login, show_user_sidebar
-current_user = require_login()
+from app.utils.auth_guard import require_auth, show_user_sidebar
+st.session_state["_page_id"] = "assets"
+current_user = require_auth()
+st.session_state["_page_id"] = "assets"
 show_user_sidebar()
 st.caption("Manage asset criticality, business units, environments, and ownership")
 

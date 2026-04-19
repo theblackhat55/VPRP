@@ -112,6 +112,24 @@ class Finding(Base):
     exception_approved_at = Column(DateTime)
     exception_expiry = Column(DateTime)
 
+    # ── SSVC decision-point columns ──
+    ssvc_exploitation = Column(String(30))
+    ssvc_system_exposure = Column(String(30))
+    ssvc_automatable = Column(String(10))
+    ssvc_human_impact = Column(String(20))
+    ssvc_priority = Column(String(30))
+    ssvc_evaluated_at = Column(DateTime)
+
+    # ── Correlation / grouping ──
+    patch_group = Column(String(500))
+    software_group = Column(String(500))
+    correlation_cluster = Column(String(200))
+
+    # ── Asset group ──
+    asset_group_id = Column(String(100))
+    asset_group_name = Column(String(200))
+    asset_group_criticality = Column(String(30))
+
     scan_upload = relationship("ScanUpload", back_populates="findings")
 
     __table_args__ = (
@@ -251,3 +269,24 @@ class User(Base):
 
     def __repr__(self):
         return f"<User {self.username} ({self.role})>"
+
+
+# ── Asset Groups ──────────────────────────────────────────
+class AssetGroup(Base):
+    __tablename__ = "asset_groups"
+
+    id = Column(String(100), primary_key=True)
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+    group_type = Column(String(50), nullable=False, default="custom")
+    match_patterns = Column(Text)  # JSON array
+    criticality = Column(String(30), default="medium")
+    owner = Column(String(200))
+    team = Column(String(200))
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow)
+    created_by = Column(String(200), default="system")
+    is_active = Column(Boolean, default=True)
+
+    def __repr__(self):
+        return f"<AssetGroup {self.name} ({self.group_type})>"
