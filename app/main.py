@@ -7,7 +7,13 @@ import pandas as pd
 import plotly.express as px
 
 from app.engine.parser import parse_uploaded_file, merge_multi_upload, FileParseResult
-from app.engine.classifier import classify_teams
+from app.engine.classifier import (
+    classify_teams,
+    classify_with_llm,
+    get_unmatched_summary,
+    add_custom_rule,
+    remove_custom_rule,
+)
 from app.engine.prioritizer import compute_risk_scores
 from app.engine.deduplicator import deduplicate_by_patch
 from app.engine.enricher import (
@@ -17,6 +23,9 @@ from app.engine.enricher import (
     ai_generate_team_summary,
 )
 from app.engine.reporter import generate_excel_report, generate_team_csv
+from app.config import (
+    DEFAULT_TEAM, load_custom_rules, get_all_team_names,
+)
 from app.utils.logger import setup_logging
 from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
 
@@ -25,6 +34,64 @@ setup_logging()
 st.set_page_config(page_title="VPRP", page_icon=APP_ICON, layout="wide")
 st.title(f"{APP_ICON} {APP_NAME}")
 st.caption(f"v{APP_VERSION} — Upload Defender CSV/JSON exports to get prioritized, team-specific remediation reports")
+
+
+# ── Helper: Custom Rules Manager UI ──────────────────────
+def _show_custom_rules_manager():
+    """Display custom rules table and add/remove UI."""
+    existing_rules = load_custom_rules()
+
+    if existing_rules:
+        st.markdown(f"**{len(existing_rules)} custom rule(s) active**")
+        rules_display = pd.DataFrame(
+            existing_rules,
+            columns=["Field", "Match Type", "Match Value", "Team"],
+        )
+        st.dataframe(rules_display, use_container_width=True, hide_index=False)
+
+        del_idx = st.number_input(
+            "Rule index to delete", min_value=0,
+            max_value=max(0, len(existing_rules) - 1),
+            value=0, key="del_rule_idx",
+        )
+        if st.button("Delete Rule", key="del_rule_btn"):
+            if remove_custom_rule(del_idx):
+                st.success(f"Rule {del_idx} deleted")
+                st.rerun()
+            else:
+                st.error("Failed to delete rule")
+    else:
+        st.info("No custom rules defined yet. Add rules below to classify unmatched findings.")
+
+    st.markdown("---")
+    st.markdown("**Add New Rule**")
+    acol1, acol2 = st.columns(2)
+    with acol1:
+        new_field = st.selectbox(
+            "Match field",
+            ["softwareName", "softwareVendor", "recommendationReference"],
+            key="new_rule_field",
+        )
+        new_match = st.selectbox(
+            "Match type",
+            ["contains", "equals", "startswith"],
+            key="new_rule_match",
+        )
+    with acol2:
+        new_value = st.text_input("Match value (case-insensitive)", key="new_rule_value")
+        all_teams = get_all_team_names()
+        new_team = st.selectbox("Assign to team", all_teams, key="new_rule_team")
+
+    if st.button("Add Rule", key="add_rule_btn", type="primary"):
+        if new_value.strip():
+            if add_custom_rule(new_field, new_match, new_value.strip().lower(), new_team):
+                st.success(f"Rule added: {new_field} {new_match} '{new_value}' → {new_team}")
+                st.rerun()
+            else:
+                st.warning("Rule already exists or invalid")
+        else:
+            st.warning("Match value cannot be empty")
+
 
 # ── Sidebar ───────────────────────────────────────────────
 with st.sidebar:
@@ -35,6 +102,8 @@ with st.sidebar:
                               help="Fetch exploit prediction scores (requires internet)")
     enable_ai = st.checkbox("Enable AI summaries", value=False,
                             help="Generate AI-powered summaries via Azure AI Foundry")
+    enable_llm_classify = st.checkbox("Enable AI classification", value=False,
+                                       help="Use LLM to classify unmatched findings (requires Azure AI)")
 
     st.divider()
     st.header("Upload Vulnerability Data")
@@ -73,6 +142,9 @@ if not uploaded_files:
     | Different RBAC group scopes | Yes |
     | Different column naming conventions (auto-mapped) | Yes |
     """)
+
+    with st.expander("Manage Custom Classification Rules"):
+        _show_custom_rules_manager()
     st.stop()
 
 # ── Step 1: Parse All Files ──────────────────────────────
@@ -134,8 +206,15 @@ mcol4.metric("Final Row Count", f"{merge_stats['total_rows_after_dedup']:,}")
 st.info(f"**Source types detected**: {', '.join(merge_stats['source_types_detected'])}")
 
 # ── Step 3: Classify, Prioritize, Enrich ─────────────────
-with st.spinner("Classifying team ownership..."):
+with st.spinner("Classifying team ownership (Tier 1: rules)..."):
     combined = classify_teams(combined)
+
+# Tier 2: Optional LLM classification
+if enable_llm_classify:
+    unmatched_count = (combined["assignedTeam"] == DEFAULT_TEAM).sum()
+    if unmatched_count > 0:
+        with st.spinner(f"AI classifying {unmatched_count} unmatched findings (Tier 2: LLM)..."):
+            combined = classify_with_llm(combined)
 
 with st.spinner("Computing risk scores..."):
     combined = compute_risk_scores(combined)
@@ -150,6 +229,18 @@ if enable_epss:
 
 with st.spinner("Grouping by root-cause patches..."):
     dedup = deduplicate_by_patch(combined)
+
+# ── Classification Summary ───────────────────────────────
+st.divider()
+st.header("Classification Summary")
+
+if "classificationTier" in combined.columns:
+    tier_counts = combined["classificationTier"].value_counts()
+    tcl1, tcl2, tcl3, tcl4 = st.columns(4)
+    tcl1.metric("Rule-Matched", tier_counts.get("rule", 0))
+    tcl2.metric("Custom Rule", tier_counts.get("custom_rule", 0))
+    tcl3.metric("AI-Classified", tier_counts.get("llm", 0))
+    tcl4.metric("Unmatched", tier_counts.get("unmatched", 0))
 
 # ── Dashboard ─────────────────────────────────────────────
 st.divider()
@@ -222,6 +313,64 @@ if not heatmap_data.empty:
     fig_heat.update_layout(height=400)
     st.plotly_chart(fig_heat, use_container_width=True)
 
+# ── Unmatched / Admin Review ─────────────────────────────
+unmatched_df = combined[combined["assignedTeam"] == DEFAULT_TEAM]
+if not unmatched_df.empty:
+    st.divider()
+    st.header("Unmatched Findings — Admin Review")
+    st.warning(
+        f"**{len(unmatched_df):,}** findings ({unmatched_df['cveId'].nunique()} unique CVEs) "
+        f"could not be auto-classified. Review below and create rules to assign them."
+    )
+
+    # Show grouped summary
+    unmatched_summary = get_unmatched_summary(combined)
+    if not unmatched_summary.empty:
+        st.dataframe(unmatched_summary, use_container_width=True, hide_index=True)
+
+    # Quick-assign form
+    st.subheader("Quick-Assign Rule")
+    st.caption("Select a row above, then create a rule to classify similar findings in future uploads.")
+
+    qcol1, qcol2 = st.columns(2)
+    with qcol1:
+        q_field = st.selectbox(
+            "Match field",
+            ["softwareName", "softwareVendor", "recommendationReference"],
+            key="q_field",
+        )
+        q_match = st.selectbox(
+            "Match type",
+            ["contains", "equals", "startswith"],
+            key="q_match",
+        )
+    with qcol2:
+        # Suggest values from unmatched data
+        if q_field in unmatched_df.columns:
+            unique_vals = sorted(unmatched_df[q_field].dropna().unique()[:50])
+            q_value = st.selectbox(
+                "Match value (from unmatched data)",
+                [""] + [str(v) for v in unique_vals],
+                key="q_value",
+            )
+        else:
+            q_value = st.text_input("Match value", key="q_value_text")
+
+        all_teams = get_all_team_names()
+        q_team = st.selectbox("Assign to team", all_teams, key="q_team")
+
+    if st.button("Create Rule & Re-classify", key="quick_assign_btn", type="primary"):
+        if q_value:
+            val = q_value.strip().lower() if isinstance(q_value, str) else str(q_value).lower()
+            if add_custom_rule(q_field, q_match, val, q_team):
+                st.success(f"Rule created: {q_field} {q_match} '{val}' → {q_team}")
+                st.info("The page will refresh to apply the new rule.")
+                st.rerun()
+            else:
+                st.warning("Rule already exists or invalid")
+        else:
+            st.warning("Select or enter a match value")
+
 # ── Team Drill-Down ───────────────────────────────────────
 st.divider()
 st.header("Team-Specific Views")
@@ -245,8 +394,12 @@ display_cols = [
     "cveId", "cvssScore", "riskScore", "riskRating",
     "vulnerabilitySeverityLevel", "exploitabilityLevel",
     "softwareName", "softwareVersion", "deviceName",
-    "recommendedSecurityUpdate", "slaBreached", "_sourceFile",
+    "recommendedSecurityUpdate", "slaBreached",
 ]
+if "classificationTier" in team_data.columns:
+    display_cols.append("classificationTier")
+if "_sourceFile" in team_data.columns:
+    display_cols.append("_sourceFile")
 display_cols = [c for c in display_cols if c in team_data.columns]
 
 st.dataframe(team_data[display_cols].head(200), use_container_width=True, height=400)
@@ -283,3 +436,8 @@ for i, team in enumerate(teams):
             mime="text/csv",
             key=f"dl_{team}",
         )
+
+# ── Custom Rules Manager (bottom) ────────────────────────
+st.divider()
+with st.expander("Manage Custom Classification Rules"):
+    _show_custom_rules_manager()

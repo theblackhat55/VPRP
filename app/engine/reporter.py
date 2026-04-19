@@ -2,8 +2,19 @@
 Generate downloadable Excel and CSV reports.
 """
 import io
+import re
 import pandas as pd
 from datetime import datetime, timezone
+
+
+def _safe_sheet_name(name: str, max_len: int = 31) -> str:
+    """Sanitize a string for use as an Excel worksheet name.
+
+    Excel forbids these characters in sheet names: \\ / * ? : [ ]
+    and limits names to 31 characters.
+    """
+    sanitized = re.sub(r'[\\/*?:\[\]]', '_', name)
+    return sanitized[:max_len]
 
 
 def generate_excel_report(
@@ -92,9 +103,18 @@ def generate_excel_report(
 
         # Per-Team Sheets
         teams = sorted(full_df["assignedTeam"].unique())
+        used_names = set()
         for team in teams:
             team_df = full_df[full_df["assignedTeam"] == team][export_cols]
-            sheet_name = team[:31]  # Excel 31 char limit
+            sheet_name = _safe_sheet_name(team)
+            # Handle duplicates after sanitization
+            base_name = sheet_name
+            counter = 2
+            while sheet_name in used_names:
+                suffix = f" ({counter})"
+                sheet_name = base_name[:31 - len(suffix)] + suffix
+                counter += 1
+            used_names.add(sheet_name)
             team_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
             ws_team = writer.sheets[sheet_name]
             for col_num, col_name in enumerate(export_cols):
