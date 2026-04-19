@@ -34,6 +34,7 @@ from app.models.db_service import (
     upsert_assets_from_findings,
     get_scan_history,
     get_trend_data,
+    get_asset_criticality_map,
 )
 from app.utils.logger import setup_logging
 from app.utils.constants import APP_NAME, APP_VERSION, APP_ICON
@@ -297,7 +298,9 @@ if enable_llm_classify:
             combined = classify_with_llm(combined)
 
 with st.spinner("Computing risk scores..."):
-    combined = compute_risk_scores(combined)
+    # Fetch asset criticality from DB for risk scoring
+    asset_crit_map = get_asset_criticality_map()
+    combined = compute_risk_scores(combined, asset_criticality_map=asset_crit_map)
 
 if enable_kev:
     with st.spinner("Enriching with CISA KEV..."):
