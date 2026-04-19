@@ -44,6 +44,8 @@ FROM base AS production
 
 COPY app/ ./app/
 COPY .streamlit/ ./.streamlit/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
 
 USER appuser
 EXPOSE 8501
