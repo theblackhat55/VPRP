@@ -1,0 +1,23 @@
+# ============================================================
+# VPRP — Development Overrides
+# Source code mounted for live reload, ports exposed directly
+# ============================================================
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+    environment:
+      - VPRP_ENV=development
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true

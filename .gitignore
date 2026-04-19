@@ -1,0 +1,43 @@
+# ── Environment & Secrets ─────────────────────────────────
+.env
+*.env.local
+*.env.production
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ── Docker runtime data ──────────────────────────────────
+data/
+
+# ── IDE ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Nginx secrets ─────────────────────────────────────────
+nginx/htpasswd
+nginx/certs/
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Uploaded vulnerability data (sensitive!) ──────────────
+uploads/
+reports/
+archives/
+backups/

@@ -1,0 +1,65 @@
+# ============================================================
+# VPRP Platform — Base Docker Compose
+# Dev:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+# Prod: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vprp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vprp}
+      POSTGRES_USER: ${POSTGRES_USER:-vprp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vprp_user} -d ${POSTGRES_DB:-vprp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vprp-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vprp-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - app_uploads:/data/uploads
+      - app_reports:/data/reports
+      - app_archives:/data/archives
+      - app_logs:/data/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - vprp-net
+
+volumes:
+  pg_data:
+    driver: local
+  app_uploads:
+    driver: local
+  app_reports:
+    driver: local
+  app_archives:
+    driver: local
+  app_logs:
+    driver: local
+
+networks:
+  vprp-net:
+    driver: bridge
