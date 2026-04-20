@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 ###############################################################################
 # VPRP – Vulnerability Prioritization & Remediation Platform
-# Interactive Deployment Script v1.1
+# Interactive Deployment Script v1.2
 #
 # Usage:
 #   chmod +x deploy.sh && ./deploy.sh
 #
-# Can be run from:
-#   - Inside the VPRP project directory (skips clone)
-#   - Outside the VPRP directory (clones or updates)
-#   - Any location — detects context automatically
+# Features:
+#   - Auto-detects Caddy and uses it instead of nginx
+#   - Smart directory detection (never creates nested clones)
+#   - Handles port conflicts automatically
+#   - Creates admin user and runs migrations
 ###############################################################################
 set -uo pipefail
-# NOTE: 'set -e' intentionally omitted — we handle errors manually
 
 # ─── Colors & helpers ────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -24,7 +24,7 @@ banner() {
   echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${CYAN}${BOLD}║                                                                  ║${NC}"
   echo -e "${CYAN}${BOLD}║     🛡️  VPRP – Vulnerability Prioritization & Remediation        ║${NC}"
-  echo -e "${CYAN}${BOLD}║                    Deployment Script v1.1                        ║${NC}"
+  echo -e "${CYAN}${BOLD}║                    Deployment Script v1.2                        ║${NC}"
   echo -e "${CYAN}${BOLD}║                                                                  ║${NC}"
   echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
   echo ""
@@ -78,6 +78,10 @@ random_string() {
   openssl rand -base64 "$1" 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c "$1"
 }
 
+is_vprp_dir() {
+  [[ -f "$1/docker-compose.yml" && -d "$1/app" && -f "$1/Dockerfile" ]]
+}
+
 # ─── Constants ───────────────────────────────────────────────────────────────
 REPO_URL="https://github.com/theblackhat55/VPRP.git"
 BRANCH="main"
@@ -92,7 +96,6 @@ step 1 "Checking prerequisites"
 
 MISSING=()
 
-# Docker
 if command -v docker &>/dev/null; then
   DOCKER_VER=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
   success "Docker $DOCKER_VER"
@@ -101,7 +104,6 @@ else
   fail "Docker not found — install: https://docs.docker.com/get-docker/"
 fi
 
-# Docker Compose
 COMPOSE_CMD=""
 if docker compose version &>/dev/null 2>&1; then
   COMPOSE_VER=$(docker compose version --short 2>/dev/null || echo "v2+")
@@ -113,95 +115,155 @@ elif command -v docker-compose &>/dev/null; then
   success "Docker Compose $COMPOSE_VER (standalone)"
 else
   MISSING+=("docker-compose")
-  fail "Docker Compose not found — install: https://docs.docker.com/compose/install/"
+  fail "Docker Compose not found"
 fi
 
-# Git
 if command -v git &>/dev/null; then
   GIT_VER=$(git --version | grep -oP '\d+\.\d+\.\d+')
   success "Git $GIT_VER"
 else
   MISSING+=("git")
-  fail "Git not found — install: sudo apt install git"
+  fail "Git not found"
 fi
 
-# openssl
 if command -v openssl &>/dev/null; then
   success "openssl available"
 else
   MISSING+=("openssl")
-  fail "openssl not found — install: sudo apt install openssl"
+  fail "openssl not found"
 fi
 
-# Abort if missing
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-  echo ""
-  fail "Missing prerequisites: ${MISSING[*]}"
-  echo "  Install them and re-run this script."
+  fail "Missing: ${MISSING[*]}. Install them and re-run."
   exit 1
 fi
 
-# Docker daemon
 if ! docker info &>/dev/null 2>&1; then
-  fail "Docker daemon is not running. Start it first:"
-  echo "    sudo systemctl start docker"
+  fail "Docker daemon not running. Start: sudo systemctl start docker"
   exit 1
 fi
-success "Docker daemon is running"
+success "Docker daemon running"
 
-# Disk space check
 AVAIL_MB=$(df -m . | awk 'NR==2{print $4}')
 if [[ "$AVAIL_MB" -lt 2048 ]]; then
-  warn "Low disk space: ${AVAIL_MB}MB available (recommend 2GB+)"
+  warn "Low disk: ${AVAIL_MB}MB (recommend 2GB+)"
 else
   success "Disk space: ${AVAIL_MB}MB available"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 2: Repository
+# Step 2: Detect reverse proxy (Caddy vs Nginx)
 # ═══════════════════════════════════════════════════════════════════════════════
-step 2 "Repository setup"
+step 2 "Detecting reverse proxy"
 
-is_vprp_dir() {
-  # Returns 0 if the given directory looks like the VPRP project
-  [[ -f "$1/docker-compose.yml" && -d "$1/app" && -f "$1/Dockerfile" ]]
-}
+USE_CADDY=false
+USE_NGINX=true
+CADDY_CONTAINER=""
+CADDY_NETWORK=""
+CADDY_CADDYFILE_PATH=""
+
+# Look for a running Caddy container
+CADDY_CONTAINER=$(docker ps --filter "ancestor=caddy" --filter "status=running" --format "{{.Names}}" 2>/dev/null | head -1)
+if [[ -z "$CADDY_CONTAINER" ]]; then
+  # Also check by container name
+  for name in caddy caddy-server caddy-proxy; do
+    if docker ps --filter "name=${name}" --filter "status=running" --format "{{.Names}}" 2>/dev/null | grep -q .; then
+      CADDY_CONTAINER="$name"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$CADDY_CONTAINER" ]]; then
+  success "Caddy detected: container '${CADDY_CONTAINER}'"
+
+  # Get Caddy's network
+  CADDY_NETWORK=$(docker inspect "$CADDY_CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')
+  success "Caddy network: ${CADDY_NETWORK}"
+
+  # Find Caddyfile mount path on host
+  CADDY_CADDYFILE_PATH=$(docker inspect "$CADDY_CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy/Caddyfile"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+  if [[ -z "$CADDY_CADDYFILE_PATH" ]]; then
+    # Try alternate mount point
+    CADDY_CADDYFILE_PATH=$(docker inspect "$CADDY_CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+    if [[ -n "$CADDY_CADDYFILE_PATH" ]]; then
+      CADDY_CADDYFILE_PATH="${CADDY_CADDYFILE_PATH}/Caddyfile"
+    fi
+  fi
+
+  if [[ -n "$CADDY_CADDYFILE_PATH" && -f "$CADDY_CADDYFILE_PATH" ]]; then
+    success "Caddyfile found: ${CADDY_CADDYFILE_PATH}"
+  else
+    # Caddyfile might be baked into image, we'll inject via docker exec
+    CADDY_CADDYFILE_PATH=""
+    info "Caddyfile not mounted — will configure via docker exec"
+  fi
+
+  echo ""
+  info "Caddy is running and can serve as VPRP's reverse proxy."
+  info "This means: automatic HTTPS, no self-signed cert warnings, no nginx needed."
+  echo ""
+  if ask_yn "Use Caddy as reverse proxy instead of nginx?" "y"; then
+    USE_CADDY=true
+    USE_NGINX=false
+    success "Using Caddy as reverse proxy"
+  else
+    USE_CADDY=false
+    USE_NGINX=true
+    info "Using built-in nginx"
+  fi
+else
+  info "No running Caddy container found — will use built-in nginx"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 3: Repository
+# ═══════════════════════════════════════════════════════════════════════════════
+step 3 "Repository setup"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURRENT_DIR="$(pwd)"
 
 if is_vprp_dir "$CURRENT_DIR"; then
-  # Running from inside the VPRP directory
   INSTALL_DIR="$CURRENT_DIR"
   info "Already inside VPRP project: $INSTALL_DIR"
-  if ask_yn "Pull latest changes from remote?" "y"; then
-    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — continuing with local copy"
+  if ask_yn "Pull latest changes?" "y"; then
+    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — using local copy"
   fi
 
 elif is_vprp_dir "$SCRIPT_DIR"; then
-  # Script lives inside the VPRP directory, but user ran from elsewhere
   INSTALL_DIR="$SCRIPT_DIR"
-  info "Deploy script is inside VPRP project: $INSTALL_DIR"
+  info "Deploy script is inside VPRP: $INSTALL_DIR"
   cd "$INSTALL_DIR"
-  if ask_yn "Pull latest changes from remote?" "y"; then
-    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — continuing with local copy"
+  if ask_yn "Pull latest changes?" "y"; then
+    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — using local copy"
   fi
 
 elif [[ -d "$CURRENT_DIR/VPRP" ]] && is_vprp_dir "$CURRENT_DIR/VPRP"; then
-  # ./VPRP subdirectory already exists
   INSTALL_DIR="$CURRENT_DIR/VPRP"
-  info "Existing VPRP clone found: $INSTALL_DIR"
+  info "Existing clone found: $INSTALL_DIR"
   cd "$INSTALL_DIR"
-  if ask_yn "Pull latest changes from remote?" "y"; then
-    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — continuing with local copy"
+  if ask_yn "Pull latest changes?" "y"; then
+    git pull origin "$BRANCH" 2>/dev/null || warn "git pull failed — using local copy"
   fi
 
 else
-  # Fresh clone needed
-  INSTALL_DIR="$CURRENT_DIR/VPRP"
-  info "Cloning VPRP from public repository..."
-  info "Target: $INSTALL_DIR"
-  git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  # Fresh clone — clone into current dir if it's named VPRP, otherwise into ./VPRP
+  DIRNAME=$(basename "$CURRENT_DIR")
+  if [[ "$DIRNAME" == "VPRP" ]]; then
+    # We're in an empty VPRP dir — clone here
+    INSTALL_DIR="$CURRENT_DIR"
+    info "Cloning into current directory: $INSTALL_DIR"
+    git clone -b "$BRANCH" "$REPO_URL" /tmp/vprp-clone-$$
+    shopt -s dotglob
+    mv /tmp/vprp-clone-$$/* "$INSTALL_DIR"/ 2>/dev/null || true
+    shopt -u dotglob
+    rm -rf /tmp/vprp-clone-$$
+  else
+    INSTALL_DIR="$CURRENT_DIR/VPRP"
+    info "Cloning repository..."
+    git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  fi
   cd "$INSTALL_DIR"
 fi
 
@@ -211,17 +273,17 @@ success "Working directory: $(pwd)"
 success "Git commit: $COMMIT_SHORT"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 3: Environment Configuration
+# Step 4: Environment Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-step 3 "Environment configuration"
+step 4 "Environment configuration"
 
 OVERWRITE_ENV=true
 if [[ -f ".env" ]]; then
   warn "Existing .env file found"
-  if ask_yn "Reconfigure? (No = keep existing settings)" "n"; then
+  if ask_yn "Reconfigure? (No = keep existing)" "n"; then
     OVERWRITE_ENV=true
     cp .env ".env.backup.$(date +%Y%m%d_%H%M%S)"
-    info "Backup saved as .env.backup.*"
+    info "Backup saved"
   else
     OVERWRITE_ENV=false
     success "Keeping existing .env"
@@ -230,16 +292,16 @@ fi
 
 if [[ "$OVERWRITE_ENV" == "true" ]]; then
 
-  # ── 3a. Application ──────────────────────────────────────────
+  # ── Application ──────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Application Settings${NC}"
   echo -e "  ─────────────────────────────────────"
   ask APP_NAME     "Application display name"                    "VPRP"
   ask APP_ICON     "Application icon (emoji)"                    "🛡️"
   ask APP_ENV      "Environment (production/staging/development)" "production"
-  ask APP_PORT     "Streamlit port (internal)"                   "8501"
+  APP_PORT="8501"
 
-  # ── 3b. Database ─────────────────────────────────────────────
+  # ── Database ─────────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Database (PostgreSQL)${NC}"
   echo -e "  ─────────────────────────────────────"
@@ -249,68 +311,64 @@ if [[ "$OVERWRITE_ENV" == "true" ]]; then
   POSTGRES_HOST="vprp-postgres"
   POSTGRES_PORT="5432"
   DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}"
-  success "Database URL configured (internal Docker network)"
+  success "Database URL configured"
 
-  # ── 3c. Security ─────────────────────────────────────────────
+  # ── Security ─────────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Security${NC}"
   echo -e "  ─────────────────────────────────────"
-  DEFAULT_SECRET=$(random_string 32)
-  ask_secret SECRET_KEY    "Session secret key" "$DEFAULT_SECRET"
-  ask SESSION_EXPIRY       "Session expiry in hours" "8"
+  ask_secret SECRET_KEY    "Session secret key" "$(random_string 32)"
+  ask SESSION_EXPIRY       "Session expiry (hours)" "8"
 
-  # ── 3d. Admin Account ───────────────────────────────────────
+  # ── Admin ────────────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Initial Admin Account${NC}"
   echo -e "  ─────────────────────────────────────"
   ask ADMIN_USERNAME       "Admin username"   "admin"
   ask_secret ADMIN_PASSWORD "Admin password"  "$(random_string 16)"
-  ask ADMIN_EMAIL          "Admin email (optional, for notifications)" ""
+  ask ADMIN_EMAIL          "Admin email (optional)" ""
 
-  # ── 3e. TLS / HTTPS ─────────────────────────────────────────
+  # ── Server / TLS ─────────────────────────────────────────────
   echo ""
-  echo -e "  ${BOLD}TLS / HTTPS${NC}"
+  echo -e "  ${BOLD}Server Settings${NC}"
   echo -e "  ─────────────────────────────────────"
-  echo -e "    ${CYAN}1)${NC} Self-signed certificate (auto-generated)"
-  echo -e "    ${CYAN}2)${NC} Let's Encrypt (requires public domain)"
-  echo -e "    ${CYAN}3)${NC} Custom certificate (bring your own)"
-  echo -e "    ${CYAN}4)${NC} None / HTTP only"
-  read -rp "$(echo -e "  ${CYAN}?${NC} TLS option [1]: ")" TLS_OPTION
-  TLS_OPTION="${TLS_OPTION:-1}"
-
   DEFAULT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
   DEFAULT_IP="${DEFAULT_IP:-localhost}"
-  ask SERVER_DOMAIN "Server domain or IP address" "$DEFAULT_IP"
+  ask SERVER_DOMAIN "Server domain or IP" "$DEFAULT_IP"
 
-  # ── 3f. HTTP/HTTPS Ports ─────────────────────────────────────
-  echo ""
-  echo -e "  ${BOLD}Web Server Ports${NC}"
-  echo -e "  ─────────────────────────────────────"
+  if [[ "$USE_CADDY" == "true" ]]; then
+    info "Caddy handles TLS automatically — no certificate setup needed"
+    TLS_OPTION="caddy"
+    PROXY_MODE="caddy"
 
-  # Check if 80/443 are in use
-  PORT_80_FREE=true
-  PORT_443_FREE=true
-  if ss -tlnp 2>/dev/null | grep -q ":80 " || netstat -tlnp 2>/dev/null | grep -q ":80 "; then
-    PORT_80_FREE=false
-    warn "Port 80 is already in use on this machine"
-  fi
-  if ss -tlnp 2>/dev/null | grep -q ":443 " || netstat -tlnp 2>/dev/null | grep -q ":443 "; then
-    PORT_443_FREE=false
-    warn "Port 443 is already in use on this machine"
-  fi
-
-  if [[ "$PORT_80_FREE" == "true" ]]; then
-    ask HTTP_PORT  "HTTP port"  "80"
+    ask VPRP_PORT "Port for VPRP web interface" "9443"
   else
-    ask HTTP_PORT  "HTTP port (80 is taken)"  "8080"
-  fi
-  if [[ "$PORT_443_FREE" == "true" ]]; then
-    ask HTTPS_PORT "HTTPS port" "443"
-  else
-    ask HTTPS_PORT "HTTPS port (443 is taken)" "8443"
+    echo ""
+    echo -e "    ${CYAN}1)${NC} Self-signed certificate (auto-generated)"
+    echo -e "    ${CYAN}2)${NC} Let's Encrypt (requires public domain)"
+    echo -e "    ${CYAN}3)${NC} Custom certificate (bring your own)"
+    echo -e "    ${CYAN}4)${NC} None / HTTP only"
+    read -rp "$(echo -e "  ${CYAN}?${NC} TLS option [1]: ")" TLS_OPTION
+    TLS_OPTION="${TLS_OPTION:-1}"
+    PROXY_MODE="nginx"
+
+    # Port selection for nginx
+    HTTP_PORT="80"
+    HTTPS_PORT="443"
+    for port in 80 443; do
+      if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        warn "Port $port is in use"
+        if [[ "$port" == "80" ]]; then
+          ask HTTP_PORT "HTTP port (80 taken)" "8080"
+        else
+          ask HTTPS_PORT "HTTPS port (443 taken)" "9443"
+        fi
+      fi
+    done
+    VPRP_PORT="${HTTPS_PORT}"
   fi
 
-  # ── 3g. Notifications ───────────────────────────────────────
+  # ── Notifications ────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Email Notifications (optional)${NC}"
   echo -e "  ─────────────────────────────────────"
@@ -323,33 +381,33 @@ if [[ "$OVERWRITE_ENV" == "true" ]]; then
     ask SMTP_PORT         "SMTP port"            "587"
     ask SMTP_USER         "SMTP username"        ""
     ask_secret SMTP_PASSWORD "SMTP password"     ""
-    ask SMTP_FROM         "From email address"   "${SMTP_USER}"
+    ask SMTP_FROM         "From email"           "${SMTP_USER}"
     ask SMTP_TLS          "Use TLS? (true/false)" "true"
   fi
 
-  # ── 3h. Backups ─────────────────────────────────────────────
+  # ── Backups ──────────────────────────────────────────────────
   echo ""
   echo -e "  ${BOLD}Backup Settings${NC}"
   echo -e "  ─────────────────────────────────────"
   ask BACKUP_ENABLED      "Enable automatic backups? (true/false)" "true"
-  ask BACKUP_RETENTION    "Backup retention in days"               "30"
-  ask BACKUP_DIR          "Backup directory"                       "./backups"
+  ask BACKUP_RETENTION    "Retention (days)"       "30"
+  ask BACKUP_DIR          "Backup directory"       "./backups"
 
-  # ── 3i. Advanced ────────────────────────────────────────────
+  # ── Advanced ─────────────────────────────────────────────────
   echo ""
-  echo -e "  ${BOLD}Advanced Settings${NC}"
+  echo -e "  ${BOLD}Advanced${NC}"
   echo -e "  ─────────────────────────────────────"
-  ask MAX_UPLOAD_SIZE     "Max file upload size in MB"             "200"
-  ask LOG_LEVEL           "Log level (DEBUG/INFO/WARNING/ERROR)"   "INFO"
+  ask MAX_UPLOAD_SIZE     "Max upload size (MB)"   "200"
+  ask LOG_LEVEL           "Log level (DEBUG/INFO/WARNING/ERROR)" "INFO"
 
-  # ── Write .env ──────────────────────────────────────────────
+  # ── Write .env ───────────────────────────────────────────────
   echo ""
   info "Writing .env file..."
 
   cat > .env <<ENVFILE
 # ═══════════════════════════════════════════════════════════════════════
 # VPRP – Environment Configuration
-# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ") by deploy.sh
+# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ") by deploy.sh v1.2
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── Application ───────────────────────────────────────────────────────
@@ -359,7 +417,7 @@ APP_ENV=${APP_ENV}
 APP_PORT=${APP_PORT}
 LOG_LEVEL=${LOG_LEVEL}
 
-# ── Database (PostgreSQL) ─────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────
 POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 POSTGRES_DB=${POSTGRES_DB}
@@ -371,19 +429,25 @@ DATABASE_URL=${DATABASE_URL}
 SECRET_KEY=${SECRET_KEY}
 SESSION_EXPIRY_HOURS=${SESSION_EXPIRY}
 
-# ── Admin Account ─────────────────────────────────────────────────────
+# ── Admin ─────────────────────────────────────────────────────────────
 ADMIN_USERNAME=${ADMIN_USERNAME}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
 ADMIN_EMAIL=${ADMIN_EMAIL}
 
-# ── Server / TLS ──────────────────────────────────────────────────────
+# ── Server / Proxy ────────────────────────────────────────────────────
 SERVER_DOMAIN=${SERVER_DOMAIN}
+PROXY_MODE=${PROXY_MODE}
 TLS_OPTION=${TLS_OPTION}
-HTTP_PORT=${HTTP_PORT}
-HTTPS_PORT=${HTTPS_PORT}
+VPRP_PORT=${VPRP_PORT:-443}
+HTTP_PORT=${HTTP_PORT:-80}
+HTTPS_PORT=${HTTPS_PORT:-443}
 MAX_UPLOAD_SIZE=${MAX_UPLOAD_SIZE}
 
-# ── Email Notifications ──────────────────────────────────────────────
+# ── Caddy (if applicable) ────────────────────────────────────────────
+CADDY_CONTAINER=${CADDY_CONTAINER}
+CADDY_NETWORK=${CADDY_NETWORK}
+
+# ── Email ─────────────────────────────────────────────────────────────
 SMTP_ENABLED=${SMTP_ENABLED}
 SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
@@ -403,182 +467,248 @@ ENVFILE
 
 fi  # end OVERWRITE_ENV
 
-# ── Source .env for remaining steps ──────────────────────────────────
+# Source .env
 set -a
 source .env
 set +a
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 4: TLS Certificates
+# Step 5: TLS / Proxy Setup
 # ═══════════════════════════════════════════════════════════════════════════════
-step 4 "TLS certificate setup"
+step 5 "Reverse proxy & TLS setup"
 
-mkdir -p nginx/certs
+PROXY_MODE="${PROXY_MODE:-nginx}"
 
-case "${TLS_OPTION:-1}" in
-  1)
-    if [[ -f "nginx/certs/selfsigned.crt" && -f "nginx/certs/selfsigned.key" ]]; then
-      CERT_EXPIRY=$(openssl x509 -enddate -noout -in nginx/certs/selfsigned.crt 2>/dev/null | cut -d= -f2)
-      info "Existing certificate (expires: ${CERT_EXPIRY:-unknown})"
-      if ask_yn "Regenerate certificate?" "n"; then
-        REGEN=true
-      else
-        REGEN=false
+if [[ "$PROXY_MODE" == "caddy" ]]; then
+  # ── Caddy setup ────────────────────────────────────────────
+  info "Configuring Caddy as reverse proxy for VPRP..."
+
+  CADDY_CONTAINER="${CADDY_CONTAINER:-caddy}"
+  CADDY_NETWORK="${CADDY_NETWORK:-}"
+  VPRP_PORT="${VPRP_PORT:-9443}"
+  VPRP_DOCKER_NETWORK=$(grep -A 5 "networks:" docker-compose.yml | grep -oP '\w+-net' | head -1 || echo "vprp_vprp-net")
+
+  # Build the Caddy snippet for VPRP
+  CADDY_VPRP_BLOCK=":${VPRP_PORT} {
+    reverse_proxy vprp-app:8501
+    encode gzip
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}"
+
+  # Check if VPRP block already exists in Caddyfile
+  ALREADY_CONFIGURED=false
+  if [[ -n "$CADDY_CADDYFILE_PATH" && -f "$CADDY_CADDYFILE_PATH" ]]; then
+    if grep -q "vprp-app:8501" "$CADDY_CADDYFILE_PATH" 2>/dev/null; then
+      ALREADY_CONFIGURED=true
+      info "VPRP already configured in Caddyfile"
+      if ask_yn "Update Caddy config?" "n"; then
+        ALREADY_CONFIGURED=false
+        # Remove old VPRP block
+        sed -i '/# VPRP-START/,/# VPRP-END/d' "$CADDY_CADDYFILE_PATH"
       fi
+    fi
+
+    if [[ "$ALREADY_CONFIGURED" == "false" ]]; then
+      info "Adding VPRP block to ${CADDY_CADDYFILE_PATH}"
+      cat >> "$CADDY_CADDYFILE_PATH" <<CADDYBLOCK
+
+# VPRP-START — managed by VPRP deploy.sh
+:${VPRP_PORT} {
+    reverse_proxy vprp-app:8501
+    encode gzip
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
+# VPRP-END
+CADDYBLOCK
+      success "Caddyfile updated"
+    fi
+  else
+    # No host-mounted Caddyfile — inject via docker exec
+    info "Injecting VPRP config into Caddy container..."
+    EXISTING_CONFIG=$(docker exec "$CADDY_CONTAINER" cat /etc/caddy/Caddyfile 2>/dev/null)
+
+    if echo "$EXISTING_CONFIG" | grep -q "vprp-app:8501"; then
+      info "VPRP already configured in Caddy"
     else
+      # Append VPRP block
+      NEW_CONFIG="${EXISTING_CONFIG}
+
+# VPRP-START — managed by VPRP deploy.sh
+:${VPRP_PORT} {
+    reverse_proxy vprp-app:8501
+    encode gzip
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
+# VPRP-END"
+
+      echo "$NEW_CONFIG" | docker exec -i "$CADDY_CONTAINER" tee /etc/caddy/Caddyfile > /dev/null
+      success "Caddy config injected"
+    fi
+  fi
+
+  # We don't need nginx — remove it from compose if present
+  info "Nginx will be skipped (Caddy handles reverse proxy)"
+
+else
+  # ── Nginx TLS setup ────────────────────────────────────────
+  mkdir -p nginx/certs
+
+  case "${TLS_OPTION:-1}" in
+    1)
       REGEN=true
-    fi
-
-    if [[ "$REGEN" == "true" ]]; then
-      info "Generating self-signed TLS certificate for ${SERVER_DOMAIN}..."
-      SAN="DNS:${SERVER_DOMAIN}"
-      if [[ "${SERVER_DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        SAN="IP:${SERVER_DOMAIN}"
+      if [[ -f "nginx/certs/selfsigned.crt" ]]; then
+        CERT_EXP=$(openssl x509 -enddate -noout -in nginx/certs/selfsigned.crt 2>/dev/null | cut -d= -f2)
+        info "Existing cert (expires: ${CERT_EXP:-unknown})"
+        if ! ask_yn "Regenerate?" "n"; then
+          REGEN=false
+        fi
       fi
-      openssl req -x509 -nodes -days 365 \
-        -newkey rsa:2048 \
-        -keyout nginx/certs/selfsigned.key \
-        -out nginx/certs/selfsigned.crt \
-        -subj "/C=US/ST=Local/L=Local/O=VPRP/CN=${SERVER_DOMAIN}" \
-        -addext "subjectAltName=${SAN}" \
-        2>/dev/null
-      chmod 600 nginx/certs/selfsigned.key
-      success "Self-signed certificate generated (valid 365 days)"
-    else
-      success "Using existing certificate"
-    fi
-    ;;
-
-  2)
-    info "Let's Encrypt — ensure ${SERVER_DOMAIN} resolves to this server"
-    if ! command -v certbot &>/dev/null; then
-      warn "certbot not found — install: sudo apt install certbot python3-certbot-nginx"
-    fi
-    # Generate temporary self-signed so nginx can start
-    if [[ ! -f "nginx/certs/selfsigned.crt" ]]; then
-      info "Generating temporary certificate for initial startup..."
-      openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
-        -keyout nginx/certs/selfsigned.key \
-        -out nginx/certs/selfsigned.crt \
-        -subj "/CN=${SERVER_DOMAIN}" 2>/dev/null
-    fi
-    ;;
-
-  3)
-    ask CERT_PATH "Path to your certificate (.crt/.pem)" ""
-    ask KEY_PATH  "Path to your private key (.key)"       ""
-    if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-      cp "$CERT_PATH" nginx/certs/selfsigned.crt
-      cp "$KEY_PATH"  nginx/certs/selfsigned.key
-      chmod 600 nginx/certs/selfsigned.key
-      success "Custom certificate installed"
-    else
-      fail "Certificate file(s) not found — generating self-signed fallback"
-      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout nginx/certs/selfsigned.key \
-        -out nginx/certs/selfsigned.crt \
-        -subj "/CN=${SERVER_DOMAIN}" 2>/dev/null
-      chmod 600 nginx/certs/selfsigned.key
-    fi
-    ;;
-
-  4)
-    warn "TLS disabled — not recommended for production"
-    # Still generate a dummy cert so nginx config doesn't break
-    if [[ ! -f "nginx/certs/selfsigned.crt" ]]; then
-      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout nginx/certs/selfsigned.key \
-        -out nginx/certs/selfsigned.crt \
-        -subj "/CN=localhost" 2>/dev/null
-    fi
-    ;;
-esac
+      if [[ "$REGEN" == "true" ]]; then
+        SAN="DNS:${SERVER_DOMAIN}"
+        [[ "${SERVER_DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && SAN="IP:${SERVER_DOMAIN}"
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout nginx/certs/selfsigned.key \
+          -out nginx/certs/selfsigned.crt \
+          -subj "/C=US/ST=Local/L=Local/O=VPRP/CN=${SERVER_DOMAIN}" \
+          -addext "subjectAltName=${SAN}" 2>/dev/null
+        chmod 600 nginx/certs/selfsigned.key
+        success "Self-signed cert generated"
+      fi
+      ;;
+    2)
+      info "Let's Encrypt — temporary cert for startup"
+      if [[ ! -f "nginx/certs/selfsigned.crt" ]]; then
+        openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+          -keyout nginx/certs/selfsigned.key \
+          -out nginx/certs/selfsigned.crt \
+          -subj "/CN=${SERVER_DOMAIN}" 2>/dev/null
+      fi
+      ;;
+    3)
+      ask CERT_PATH "Certificate path (.crt/.pem)" ""
+      ask KEY_PATH  "Private key path (.key)"       ""
+      if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
+        cp "$CERT_PATH" nginx/certs/selfsigned.crt
+        cp "$KEY_PATH"  nginx/certs/selfsigned.key
+        chmod 600 nginx/certs/selfsigned.key
+        success "Custom cert installed"
+      else
+        fail "Files not found — generating self-signed"
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout nginx/certs/selfsigned.key \
+          -out nginx/certs/selfsigned.crt \
+          -subj "/CN=${SERVER_DOMAIN}" 2>/dev/null
+      fi
+      ;;
+    4)
+      warn "No TLS — not recommended"
+      if [[ ! -f "nginx/certs/selfsigned.crt" ]]; then
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout nginx/certs/selfsigned.key \
+          -out nginx/certs/selfsigned.crt \
+          -subj "/CN=localhost" 2>/dev/null
+      fi
+      ;;
+  esac
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 5: Pre-flight checks
+# Step 6: Pre-flight
 # ═══════════════════════════════════════════════════════════════════════════════
-step 5 "Pre-flight checks"
+step 6 "Pre-flight checks"
 
-# Create required directories
 mkdir -p "${BACKUP_DIR:-./backups}" data logs
 success "Directories created"
 
-# Check compose files
-COMPOSE_FILES="-f docker-compose.yml"
-if [[ -f "docker-compose.yml" ]]; then
-  success "docker-compose.yml found"
-else
-  fail "docker-compose.yml not found — cannot continue"
+if [[ ! -f "docker-compose.yml" ]]; then
+  fail "docker-compose.yml not found"
   exit 1
 fi
+success "docker-compose.yml found"
+
+COMPOSE_FILES="-f docker-compose.yml"
 if [[ -f "docker-compose.prod.yml" ]]; then
   COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.prod.yml"
-  success "docker-compose.prod.yml found (production overrides)"
+  success "docker-compose.prod.yml found"
 fi
 
-# Validate critical .env values
+# Validate .env
 PREFLIGHT_PASS=true
 for var in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB DATABASE_URL SECRET_KEY; do
   if [[ -z "${!var:-}" ]]; then
-    fail "Missing required: $var"
+    fail "Missing: $var"
     PREFLIGHT_PASS=false
   fi
 done
-if [[ "$PREFLIGHT_PASS" == "true" ]]; then
-  success "All required environment variables present"
-else
-  fail "Fix .env and re-run"
-  exit 1
-fi
+[[ "$PREFLIGHT_PASS" == "true" ]] && success "Environment variables OK" || { fail "Fix .env"; exit 1; }
 
-# ── Update docker-compose.prod.yml ports if non-standard ─────
-HTTP_PORT="${HTTP_PORT:-80}"
-HTTPS_PORT="${HTTPS_PORT:-443}"
-
-if [[ "$HTTP_PORT" != "80" || "$HTTPS_PORT" != "443" ]]; then
-  info "Updating nginx ports to ${HTTP_PORT}:80 and ${HTTPS_PORT}:443..."
-  if [[ -f "docker-compose.prod.yml" ]]; then
-    sed -i "s|\"80:80\"|\"${HTTP_PORT}:80\"|g"   docker-compose.prod.yml
-    sed -i "s|\"443:443\"|\"${HTTPS_PORT}:443\"|g" docker-compose.prod.yml
-    success "Ports updated in docker-compose.prod.yml"
+# Update nginx ports in compose if needed (nginx mode only)
+if [[ "$PROXY_MODE" != "caddy" ]]; then
+  HTTP_PORT="${HTTP_PORT:-80}"
+  HTTPS_PORT="${HTTPS_PORT:-443}"
+  if [[ "$HTTP_PORT" != "80" || "$HTTPS_PORT" != "443" ]]; then
+    if [[ -f "docker-compose.prod.yml" ]]; then
+      sed -i "s|\"80:80\"|\"${HTTP_PORT}:80\"|g"     docker-compose.prod.yml
+      sed -i "s|\"443:443\"|\"${HTTPS_PORT}:443\"|g"  docker-compose.prod.yml
+      success "Nginx ports updated: ${HTTP_PORT}:80, ${HTTPS_PORT}:443"
+    fi
   fi
 fi
 
-# Stop existing VPRP containers gracefully (ignore errors)
+# Stop existing VPRP containers
 RUNNING=$(docker ps -q --filter "name=vprp-" 2>/dev/null | wc -l)
 if [[ "$RUNNING" -gt 0 ]]; then
   info "Stopping existing VPRP containers..."
   $COMPOSE_CMD $COMPOSE_FILES down 2>/dev/null || true
   success "Previous containers stopped"
-else
-  info "No existing VPRP containers running"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 6: Build & Start
+# Step 7: Build & Start
 # ═══════════════════════════════════════════════════════════════════════════════
-step 6 "Building and starting containers"
+step 7 "Building and starting containers"
 
 info "Pulling base images..."
 $COMPOSE_CMD $COMPOSE_FILES pull --ignore-buildable 2>/dev/null || true
 
-info "Building application image (this may take 1-3 minutes)..."
+info "Building application image..."
 if ! $COMPOSE_CMD $COMPOSE_FILES build app; then
-  fail "Docker build failed. Check the Dockerfile and try again."
+  fail "Build failed"
   exit 1
+fi
+
+if [[ "$PROXY_MODE" == "caddy" ]]; then
+  # Start only app + postgres, skip nginx
+  info "Starting app and database (Caddy handles proxy)..."
+  $COMPOSE_CMD $COMPOSE_FILES up -d app postgres 2>/dev/null \
+    || $COMPOSE_CMD $COMPOSE_FILES up -d 2>/dev/null
+
+  # Stop nginx if it started
+  docker stop vprp-nginx 2>/dev/null || true
+  docker rm vprp-nginx 2>/dev/null || true
+else
+  info "Starting all services..."
+  if ! $COMPOSE_CMD $COMPOSE_FILES up -d; then
+    fail "Failed to start"
+    exit 1
+  fi
 fi
 echo ""
 
-info "Starting all services..."
-if ! $COMPOSE_CMD $COMPOSE_FILES up -d; then
-  fail "Failed to start containers"
-  echo "  Debug: $COMPOSE_CMD $COMPOSE_FILES logs --tail 30"
-  exit 1
-fi
-echo ""
-
-# ── Wait for health ──────────────────────────────────────────
-info "Waiting for services to become healthy..."
+# ── Health check loop ────────────────────────────────────────
+info "Waiting for services..."
 MAX_WAIT=120
 ELAPSED=0
 HEALTHY=false
@@ -588,15 +718,10 @@ while [[ $ELAPSED -lt $MAX_WAIT ]]; do
   APP_STATE=$(docker inspect --format='{{.State.Status}}' vprp-app 2>/dev/null || echo "waiting")
   APP_RESTART=$(docker inspect --format='{{.RestartCount}}' vprp-app 2>/dev/null || echo "0")
 
-  # Crash-loop detection
   if [[ "$APP_RESTART" -gt 3 ]]; then
     echo ""
-    fail "Application is crash-looping (${APP_RESTART} restarts)"
-    echo ""
-    echo "  Recent logs:"
+    fail "App crash-looping (${APP_RESTART} restarts)"
     $COMPOSE_CMD $COMPOSE_FILES logs --tail 30 app 2>/dev/null || true
-    echo ""
-    fail "Fix the issue above and re-run deploy.sh"
     exit 1
   fi
 
@@ -615,41 +740,96 @@ done
 echo ""
 
 if [[ "$HEALTHY" != "true" ]]; then
-  fail "Services did not become healthy within ${MAX_WAIT}s"
-  echo ""
-  echo "  Debug commands:"
-  echo "    $COMPOSE_CMD $COMPOSE_FILES ps"
-  echo "    $COMPOSE_CMD $COMPOSE_FILES logs --tail 80 app"
-  echo "    $COMPOSE_CMD $COMPOSE_FILES logs --tail 30 postgres"
+  fail "Not healthy after ${MAX_WAIT}s"
+  echo "  $COMPOSE_CMD $COMPOSE_FILES logs --tail 50 app"
   exit 1
 fi
 
-echo ""
-echo -e "  ${BOLD}Service Status:${NC}"
-success "PostgreSQL:   healthy"
-success "Application:  running (HTTP 200)"
-NGINX_STATUS=$(docker inspect --format='{{.State.Status}}' vprp-nginx 2>/dev/null || echo "not found")
-[[ "$NGINX_STATUS" == "running" ]] && success "Nginx:        running" || warn "Nginx:        $NGINX_STATUS"
+success "PostgreSQL: healthy"
+success "Application: running (HTTP 200)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 7: Database Migrations
+# Step 8: Connect Caddy to VPRP network (if Caddy mode)
 # ═══════════════════════════════════════════════════════════════════════════════
-step 7 "Running database migrations"
+if [[ "$PROXY_MODE" == "caddy" ]]; then
+  step 8 "Connecting Caddy to VPRP"
 
-info "Applying Alembic migrations..."
+  # Find the VPRP network name
+  VPRP_NETWORK=$(docker inspect vprp-app --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | awk '{print $1}')
+
+  if [[ -n "$VPRP_NETWORK" ]]; then
+    info "VPRP network: ${VPRP_NETWORK}"
+
+    # Connect Caddy to VPRP network
+    if docker network connect "$VPRP_NETWORK" "$CADDY_CONTAINER" 2>/dev/null; then
+      success "Caddy connected to ${VPRP_NETWORK}"
+    else
+      info "Caddy already on ${VPRP_NETWORK} (or connection exists)"
+    fi
+
+    # Verify connectivity
+    if docker exec "$CADDY_CONTAINER" wget -q -O /dev/null --timeout=5 http://vprp-app:8501/_stcore/health 2>/dev/null; then
+      success "Caddy → vprp-app connectivity verified"
+    else
+      warn "Connectivity check failed — trying with IP fallback"
+      VPRP_IP=$(docker inspect vprp-app --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+      if docker exec "$CADDY_CONTAINER" wget -q -O /dev/null --timeout=5 "http://${VPRP_IP}:8501/_stcore/health" 2>/dev/null; then
+        success "Caddy → vprp-app OK via IP (${VPRP_IP})"
+        warn "Using IP in Caddy config instead of hostname"
+        # Update Caddy config to use IP
+        if [[ -n "$CADDY_CADDYFILE_PATH" && -f "$CADDY_CADDYFILE_PATH" ]]; then
+          sed -i "s|vprp-app:8501|${VPRP_IP}:8501|g" "$CADDY_CADDYFILE_PATH"
+        else
+          docker exec "$CADDY_CONTAINER" sed -i "s|vprp-app:8501|${VPRP_IP}:8501|g" /etc/caddy/Caddyfile 2>/dev/null || true
+        fi
+      else
+        fail "Cannot reach vprp-app from Caddy"
+        warn "You may need to manually configure networking"
+      fi
+    fi
+
+    # Reload Caddy
+    info "Reloading Caddy configuration..."
+    docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \
+      && success "Caddy reloaded" \
+      || warn "Caddy reload failed — try: docker restart $CADDY_CONTAINER"
+
+    # Verify VPRP is accessible through Caddy
+    sleep 2
+    VPRP_PORT="${VPRP_PORT:-9443}"
+    CADDY_CHECK=$(docker exec "$CADDY_CONTAINER" wget -q -O /dev/null --timeout=5 "http://localhost:${VPRP_PORT}" 2>/dev/null && echo "OK" || echo "FAIL")
+    if [[ "$CADDY_CHECK" == "OK" ]]; then
+      success "VPRP accessible via Caddy on port ${VPRP_PORT}"
+    else
+      info "Direct check inconclusive — try browser access"
+    fi
+  else
+    warn "Could not determine VPRP network"
+  fi
+
+  NEXT_STEP=9
+else
+  NEXT_STEP=9
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 9: Database Migrations
+# ═══════════════════════════════════════════════════════════════════════════════
+step "$NEXT_STEP" "Running database migrations"
+
 MIGRATION_OUTPUT=$(docker exec vprp-app alembic -c /app/alembic.ini upgrade head 2>&1) || true
 
 if echo "$MIGRATION_OUTPUT" | grep -qiE "error|traceback"; then
-  warn "Migration had warnings:"
+  warn "Migration warnings:"
   echo "$MIGRATION_OUTPUT" | tail -5
 else
   success "Migrations applied"
 fi
 
 ALEMBIC_REV=$(docker exec vprp-app alembic -c /app/alembic.ini current 2>&1 | grep -oP '[a-f0-9]{12}' | head -1 || echo "unknown")
-success "Alembic revision: ${ALEMBIC_REV}"
+success "Alembic: ${ALEMBIC_REV}"
 
-# Verify key tables
+# Table check
 TABLE_CHECK=$(docker exec vprp-app python -c "
 from app.models.database import engine
 from sqlalchemy import inspect
@@ -660,30 +840,24 @@ print(f'MISSING:{chr(44).join(missing)}' if missing else f'OK:{len(tables)}')
 " 2>&1) || true
 
 if [[ "$TABLE_CHECK" == OK* ]]; then
-  success "Database schema verified (${TABLE_CHECK#OK:} tables)"
-elif [[ "$TABLE_CHECK" == MISSING* ]]; then
-  warn "Missing tables: ${TABLE_CHECK#MISSING:}"
+  success "Schema verified (${TABLE_CHECK#OK:} tables)"
 else
-  warn "Schema check: $TABLE_CHECK"
+  warn "Schema: $TABLE_CHECK"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 8: Create Admin User
+# Step 10: Create Admin User
 # ═══════════════════════════════════════════════════════════════════════════════
-step 8 "Creating initial admin user"
+step "$((NEXT_STEP + 1))" "Creating admin user"
 
 ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 
 if [[ -z "$ADMIN_PASSWORD" ]]; then
-  warn "No ADMIN_PASSWORD in .env — skipping admin creation"
-  warn "Create one manually via the Administration page"
+  warn "No ADMIN_PASSWORD — skipping"
 else
-  # Escape single quotes in password for Python
   ESCAPED_PW=$(echo "$ADMIN_PASSWORD" | sed "s/'/\\\\'/g")
-
   ADMIN_RESULT=$(docker exec vprp-app python -c "
-import sys
 try:
     from app.models.auth_service import create_user, list_users
     users = list_users()
@@ -698,87 +872,44 @@ except Exception as e:
 " 2>&1) || true
 
   case "$ADMIN_RESULT" in
-    *EXISTS*)  info "Admin user '${ADMIN_USERNAME}' already exists" ;;
-    *CREATED*) success "Admin user '${ADMIN_USERNAME}' created" ;;
-    *ERROR*)   warn "Could not create admin: ${ADMIN_RESULT#*ERROR:}" ;;
-    *)         warn "Admin creation result: $ADMIN_RESULT" ;;
+    *EXISTS*)  info "Admin '${ADMIN_USERNAME}' already exists" ;;
+    *CREATED*) success "Admin '${ADMIN_USERNAME}' created" ;;
+    *ERROR*)   warn "Admin creation: ${ADMIN_RESULT#*ERROR:}" ;;
+    *)         warn "Result: $ADMIN_RESULT" ;;
   esac
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 9: Let's Encrypt (if selected)
-# ═══════════════════════════════════════════════════════════════════════════════
-if [[ "${TLS_OPTION:-1}" == "2" ]]; then
-  step 9 "Let's Encrypt certificate"
-
-  if command -v certbot &>/dev/null; then
-    ask CERTBOT_EMAIL "Email for Let's Encrypt" "${ADMIN_EMAIL:-}"
-    info "Requesting certificate for ${SERVER_DOMAIN}..."
-    sudo certbot certonly --standalone \
-      --preferred-challenges http \
-      -d "${SERVER_DOMAIN}" \
-      --email "${CERTBOT_EMAIL}" \
-      --agree-tos --non-interactive 2>&1 | tail -5 || true
-
-    LE_CERT="/etc/letsencrypt/live/${SERVER_DOMAIN}/fullchain.pem"
-    LE_KEY="/etc/letsencrypt/live/${SERVER_DOMAIN}/privkey.pem"
-    if [[ -f "$LE_CERT" && -f "$LE_KEY" ]]; then
-      sudo cp "$LE_CERT" nginx/certs/selfsigned.crt
-      sudo cp "$LE_KEY"  nginx/certs/selfsigned.key
-      sudo chmod 600 nginx/certs/selfsigned.key
-      $COMPOSE_CMD $COMPOSE_FILES restart nginx
-      success "Let's Encrypt certificate installed and nginx restarted"
-    else
-      warn "Certbot did not produce certificates — using self-signed fallback"
-    fi
-  else
-    warn "certbot not installed — run manually:"
-    echo "    sudo apt install certbot"
-    echo "    sudo certbot certonly --standalone -d ${SERVER_DOMAIN}"
-  fi
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Step 10: Final Summary
+# Summary
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}║                                                                  ║${NC}"
-echo -e "${GREEN}${BOLD}║           🛡️  VPRP Deployed Successfully!                         ║${NC}"
+echo -e "${GREEN}${BOLD}║            🛡️  VPRP Deployed Successfully!                        ║${NC}"
 echo -e "${GREEN}${BOLD}║                                                                  ║${NC}"
 echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
 
-# ── Access URLs ──────────────────────────────────────────────
 echo ""
-echo -e "  ${BOLD}Access URLs${NC}"
+echo -e "  ${BOLD}Access URL${NC}"
 echo -e "  ─────────────────────────────────────────────────"
-HTTP_PORT="${HTTP_PORT:-80}"
-HTTPS_PORT="${HTTPS_PORT:-443}"
+if [[ "$PROXY_MODE" == "caddy" ]]; then
+  VPRP_PORT="${VPRP_PORT:-9443}"
+  echo -e "    ${CYAN}https://${SERVER_DOMAIN}:${VPRP_PORT}/${NC}"
+  echo ""
+  echo -e "  ${BOLD}Proxy${NC}: Caddy (container: ${CADDY_CONTAINER})"
+else
+  HTTP_PORT="${HTTP_PORT:-80}"
+  HTTPS_PORT="${HTTPS_PORT:-443}"
+  if [[ "$HTTPS_PORT" == "443" ]]; then
+    echo -e "    HTTPS:  ${CYAN}https://${SERVER_DOMAIN}/${NC}"
+  else
+    echo -e "    HTTPS:  ${CYAN}https://${SERVER_DOMAIN}:${HTTPS_PORT}/${NC}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Proxy${NC}: nginx (built-in)"
+fi
 
-case "${TLS_OPTION:-1}" in
-  1|2|3)
-    if [[ "$HTTPS_PORT" == "443" ]]; then
-      echo -e "    HTTPS:  ${CYAN}https://${SERVER_DOMAIN}/${NC}"
-    else
-      echo -e "    HTTPS:  ${CYAN}https://${SERVER_DOMAIN}:${HTTPS_PORT}/${NC}"
-    fi
-    if [[ "$HTTP_PORT" == "80" ]]; then
-      echo -e "    HTTP:   ${CYAN}http://${SERVER_DOMAIN}/${NC}  (redirects to HTTPS)"
-    else
-      echo -e "    HTTP:   ${CYAN}http://${SERVER_DOMAIN}:${HTTP_PORT}/${NC}  (redirects to HTTPS)"
-    fi
-    ;;
-  4)
-    if [[ "$HTTP_PORT" == "80" ]]; then
-      echo -e "    HTTP:   ${CYAN}http://${SERVER_DOMAIN}/${NC}"
-    else
-      echo -e "    HTTP:   ${CYAN}http://${SERVER_DOMAIN}:${HTTP_PORT}/${NC}"
-    fi
-    ;;
-esac
-
-# ── Credentials ──────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Admin Login${NC}"
 echo -e "  ─────────────────────────────────────────────────"
@@ -790,48 +921,37 @@ if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
   else
     MASKED="***"
   fi
-  echo -e "    Password:  ${CYAN}${MASKED}${NC}  (see .env for full value)"
-fi
-
-# ── Container Status ─────────────────────────────────────────
-echo ""
-echo -e "  ${BOLD}Container Status${NC}"
-echo -e "  ─────────────────────────────────────────────────"
-$COMPOSE_CMD $COMPOSE_FILES ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null \
-  || $COMPOSE_CMD $COMPOSE_FILES ps
-
-# ── Useful Commands ──────────────────────────────────────────
-echo ""
-echo -e "  ${BOLD}Useful Commands${NC}"
-echo -e "  ─────────────────────────────────────────────────"
-echo -e "    View logs:         ${CYAN}$COMPOSE_CMD $COMPOSE_FILES logs -f app${NC}"
-echo -e "    Stop everything:   ${CYAN}$COMPOSE_CMD $COMPOSE_FILES down${NC}"
-echo -e "    Restart app:       ${CYAN}$COMPOSE_CMD $COMPOSE_FILES restart app${NC}"
-echo -e "    Rebuild & deploy:  ${CYAN}$COMPOSE_CMD $COMPOSE_FILES up -d --build app${NC}"
-echo -e "    Database backup:   ${CYAN}docker exec vprp-postgres pg_dump -U ${POSTGRES_USER} ${POSTGRES_DB} > backup.sql${NC}"
-echo -e "    Alembic status:    ${CYAN}docker exec vprp-app alembic -c /app/alembic.ini current${NC}"
-echo -e "    App shell:         ${CYAN}docker exec -it vprp-app /bin/bash${NC}"
-echo -e "    DB shell:          ${CYAN}docker exec -it vprp-postgres psql -U ${POSTGRES_USER} ${POSTGRES_DB}${NC}"
-
-# ── File Locations ───────────────────────────────────────────
-echo ""
-echo -e "  ${BOLD}File Locations${NC}"
-echo -e "  ─────────────────────────────────────────────────"
-echo -e "    Project:       ${CYAN}$(pwd)${NC}"
-echo -e "    Environment:   ${CYAN}$(pwd)/.env${NC}"
-echo -e "    Backups:       ${CYAN}$(pwd)/${BACKUP_DIR:-./backups}${NC}"
-echo -e "    TLS certs:     ${CYAN}$(pwd)/nginx/certs/${NC}"
-
-# ── Warnings ─────────────────────────────────────────────────
-echo ""
-if [[ "${TLS_OPTION:-1}" == "1" ]]; then
-  warn "Self-signed certificate — browser will show a security warning (expected)."
-  echo -e "    For production, use Let's Encrypt (option 2) or a CA-signed certificate."
-fi
-if [[ "${APP_ENV:-}" != "production" ]]; then
-  warn "Running in '${APP_ENV}' mode."
+  echo -e "    Password:  ${CYAN}${MASKED}${NC}  (see .env)"
 fi
 
 echo ""
-success "Deployment finished at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+echo -e "  ${BOLD}Containers${NC}"
+echo -e "  ─────────────────────────────────────────────────"
+docker ps --filter "name=vprp-" --format "    {{.Names}}  {{.Status}}" 2>/dev/null
+
+echo ""
+echo -e "  ${BOLD}Commands${NC}"
+echo -e "  ─────────────────────────────────────────────────"
+echo -e "    View logs:      ${CYAN}cd $(pwd) && $COMPOSE_CMD $COMPOSE_FILES logs -f app${NC}"
+echo -e "    Stop:           ${CYAN}cd $(pwd) && $COMPOSE_CMD $COMPOSE_FILES down${NC}"
+echo -e "    Restart:        ${CYAN}docker restart vprp-app${NC}"
+echo -e "    Rebuild:        ${CYAN}cd $(pwd) && $COMPOSE_CMD $COMPOSE_FILES up -d --build app${NC}"
+echo -e "    DB backup:      ${CYAN}docker exec vprp-postgres pg_dump -U ${POSTGRES_USER} ${POSTGRES_DB} > backup.sql${NC}"
+echo -e "    DB shell:       ${CYAN}docker exec -it vprp-postgres psql -U ${POSTGRES_USER} ${POSTGRES_DB}${NC}"
+echo -e "    App shell:      ${CYAN}docker exec -it vprp-app /bin/bash${NC}"
+
+echo ""
+echo -e "  ${BOLD}Files${NC}"
+echo -e "  ─────────────────────────────────────────────────"
+echo -e "    Project:     ${CYAN}$(pwd)${NC}"
+echo -e "    Config:      ${CYAN}$(pwd)/.env${NC}"
+echo -e "    Backups:     ${CYAN}$(pwd)/${BACKUP_DIR:-./backups}${NC}"
+
+if [[ "$PROXY_MODE" != "caddy" && "${TLS_OPTION:-1}" == "1" ]]; then
+  echo ""
+  warn "Self-signed cert — browser will show a security warning (normal)."
+fi
+
+echo ""
+success "Done! $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo ""
